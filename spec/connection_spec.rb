@@ -102,4 +102,31 @@ describe Connection do
   it "should not set as threaded when app do not respond to deferred?" do
     @connection.should_not be_threaded
   end
+  
+  it "should support continuations from the app" do
+    @connection.app = Proc.new do |env|
+      Proc.new do
+        [200, {}, ['']]
+      end
+    end
+    EventMachine.should_receive(:next_tick).and_yield()
+    @connection.should_receive(:send_data).twice()
+    
+    @connection.process
+  end
+  
+  it "should support unlimited continuations" do
+    @connection.app = Proc.new do |env|
+      Proc.new do
+        Proc.new do
+          [200, {}, ['']]
+        end
+      end
+    end
+    
+    EventMachine.should_receive(:next_tick).twice().and_yield()
+    @connection.should_receive(:send_data).twice()
+    
+    @connection.process
+  end
 end

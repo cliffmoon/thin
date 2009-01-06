@@ -69,25 +69,42 @@ module Thin
 
     def post_process(result)
       return unless result
+      send_results = Proc.new do |result|
+        # Set the Content-Length header if possible
+        set_content_length(result) if need_content_length?(result)
 
-      # Set the Content-Length header if possible
-      set_content_length(result) if need_content_length?(result)
+        @response.status, @response.headers, @response.body = result
 
-      @response.status, @response.headers, @response.body = result
+        log "!! Rack application returned nil body. Probably you wanted it to be an empty string?" if @response.body.nil?
+        # Make the response persistent if requested by the client
+        @response.persistent! if @request.persistent?
 
-      log "!! Rack application returned nil body. Probably you wanted it to be an empty string?" if @response.body.nil?
-      # Make the response persistent if requested by the client
-      @response.persistent! if @request.persistent?
+        # Send the response
+        @response.each do |chunk|
+          trace { chunk }
+          send_data chunk
+        end
 
-      # Send the response
-      @response.each do |chunk|
-        trace { chunk }
-        send_data chunk
+        # If no more request on that same connection, we close it.
+        close_connection_after_writing unless persistent?
       end
-
-      # If no more request on that same connection, we close it.
-      close_connection_after_writing unless persistent?
-
+      if result.is_a?(Proc)
+        callback = Proc.new do |result|
+          result = result.call
+          if result.is_a?(Proc)
+            EM.next_tick do
+              callback.call(result)
+            end
+          else
+            send_results.call(result)
+          end
+        end
+        EM.next_tick do
+          callback.call(result)
+        end
+      else
+        send_results.call(result)
+      end
     rescue Exception
       handle_error
     ensure
