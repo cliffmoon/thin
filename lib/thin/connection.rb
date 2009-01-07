@@ -10,7 +10,10 @@ module Thin
     CHUNKED_REGEXP    = /\bchunked\b/i.freeze
 
     include Logging
-
+    
+    # This is a template async response. N.B. Can't use string for body on 1.9
+    AsyncResponse = [-1, {}, []].freeze
+    
     # Rack application (adapter) served by this connection.
     attr_accessor :app
 
@@ -59,8 +62,24 @@ module Thin
       # Add client info to the request env
       @request.remote_address = remote_address
 
-      # Process the request calling the Rack adapter
-      @app.call(@request.env)
+      # TODO - remove excess documentation / move it somewhere more sensible.
+      # (interface specs!) - (rack)
+      
+      # Connection may be closed unless the App#call response was a [-1, ...]
+      # It should be noted that connection objects will linger until this 
+      # callback is no longer referenced, so be tidy!
+      @request.env['async.callback'] = method(:post_process)
+      @request.env['async.close'] = EM::DefaultDeferrable.new
+      
+      # When we're under a non-async framework like rails, we can still spawn
+      # off async responses using the callback info, so there's little point
+      # in removing this.
+      response = AsyncResponse
+      catch(:async) do
+        # Process the request calling the Rack adapter
+        response = @app.call(@request.env)
+      end
+      response
     rescue Exception
       handle_error
       terminate_request
@@ -69,46 +88,38 @@ module Thin
 
     def post_process(result)
       return unless result
-      send_results = Proc.new do |result|
-        # Set the Content-Length header if possible
-        set_content_length(result) if need_content_length?(result)
+      result = result.to_a
+      
+      # Status code -1 indicates that we're going to respond later (async).
+      return if result.first == AsyncResponse.first
 
-        @response.status, @response.headers, @response.body = result
+      # Set the Content-Length header if possible
+      set_content_length(result) if need_content_length?(result)
+      
+      @response.status, @response.headers, @response.body = *result
 
-        log "!! Rack application returned nil body. Probably you wanted it to be an empty string?" if @response.body.nil?
-        # Make the response persistent if requested by the client
-        @response.persistent! if @request.persistent?
+      log "!! Rack application returned nil body. Probably you wanted it to be an empty string?" if @response.body.nil?
 
-        # Send the response
-        @response.each do |chunk|
-          trace { chunk }
-          send_data chunk
-        end
+      # Make the response persistent if requested by the client
+      @response.persistent! if @request.persistent?
 
-        # If no more request on that same connection, we close it.
-        close_connection_after_writing unless persistent?
+      # Send the response
+      @response.each do |chunk|
+        trace { chunk }
+        send_data chunk
       end
-      if result.is_a?(Proc)
-        callback = Proc.new do |result|
-          result = result.call
-          if result.is_a?(Proc)
-            EM.next_tick do
-              callback.call(result)
-            end
-          else
-            send_results.call(result)
-          end
-        end
-        EM.next_tick do
-          callback.call(result)
-        end
-      else
-        send_results.call(result)
-      end
+
     rescue Exception
       handle_error
     ensure
-      terminate_request
+      # If the body is being deferred, then terminate afterward.
+      if @response.body.respond_to?(:callback) && @response.body.respond_to?(:errback)
+        @response.body.callback { terminate_request }
+        @response.body.errback  { terminate_request }
+      else
+        # Don't terminate the response if we're going async.
+        terminate_request unless result && result.first == AsyncResponse.first
+      end
     end
 
     # Logs catched exception and closes the connection.
@@ -118,22 +129,33 @@ module Thin
       close_connection rescue nil
     end
 
+    def close_request_response
+      @request.env['async.close'].succeed
+      @request.close  rescue nil
+      @response.close rescue nil
+    end
+
     # Does request and response cleanup (closes open IO streams and
     # deletes created temporary files).
     # Re-initializes response and request if client supports persistent
     # connection.
     def terminate_request
-      @request.close  rescue nil
-      @response.close rescue nil
-
-      # Prepare the connection for another request if the client
-      # supports HTTP pipelining (persistent connection).
-      post_init if persistent?
+      unless persistent?
+        close_connection_after_writing rescue nil
+        close_request_response
+      else
+        close_request_response
+        # Prepare the connection for another request if the client
+        # supports HTTP pipelining (persistent connection).
+        post_init
+      end
     end
 
     # Called when the connection is unbinded from the socket
     # and can no longer be used to process requests.
     def unbind
+      @request.env['async.close'].succeed if @request.env['async.close']
+      @response.body.fail if @response.body.respond_to?(:fail)
       @backend.connection_finished(self)
     end
 
@@ -178,6 +200,7 @@ module Thin
     private
       def need_content_length?(result)
         status, headers, body = result
+        return false if status == -1
         return false if headers.has_key?(CONTENT_LENGTH)
         return false if (100..199).include?(status) || status == 204 || status == 304
         return false if headers.has_key?(TRANSFER_ENCODING) && headers[TRANSFER_ENCODING] =~ CHUNKED_REGEXP
